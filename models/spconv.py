@@ -32,7 +32,10 @@ class SPConv2D1x1(nn.Module):
             return F.linear(x, self.weight, self.bias)
         else:
             z = x.permute(0, 2, 3, 1).contiguous() # channel_last
-            bi, yi, xi = indices.T
+            # bi, yi, xi = indices.T
+            bi = indices[:, 0]
+            yi = indices[:, 1]
+            xi = indices[:, 2]
             y = F.linear(z[bi, yi, xi], self.weight, self.bias)
             if to_dense:
                 # assert z.shape[-1] == y.shape[-1]
@@ -64,7 +67,10 @@ class SPConv2Dkxk(nn.Module):
         unfold = F.unfold(x, self.kernel_size, padding=self.padding, stride=self.stride)
         unfold = unfold.transpose(1, 2).view(bs, ny, nx, c1*np.prod(self.kernel_size))
 
-        bi, yi, xi = indices.T
+        # bi, yi, xi = indices.T
+        bi = indices[:, 0]
+        yi = indices[:, 1]
+        xi = indices[:, 2]
         z = F.linear(unfold[bi, yi, xi], self.weight_flatten, self.bias)
 
         if to_dense:
@@ -147,12 +153,16 @@ if __name__ == '__main__':
         # dummy
         unfold = F.unfold(inp*0.1, k, padding=p, stride=s)
         unfold = unfold.transpose(1, 2).view(bs, h, w, c1*k*k)
-        y = unfold @ conv.weight.flatten(1).T + conv.bias
+        # y = unfold @ conv.weight.flatten(1).T + conv.bias
+        y = torch.matmul(unfold, conv.weight.flatten(1).transpose(0, 1)) + conv.bias
+
 
         t0 = time_synchronized()
         unfold = F.unfold(inp, k, padding=p, stride=s)
         unfold = unfold.transpose(1, 2).view(bs, h, w, c1*k*k)
-        y = unfold @ conv.weight.flatten(1).T + conv.bias
+        # y = unfold @ conv.weight.flatten(1).T + conv.bias
+        y = torch.matmul(unfold, conv.weight.flatten(1).transpose(0, 1)) + conv.bias
+
         t1 = time_synchronized()
         y = y.permute(0, 3, 1, 2).contiguous()
 

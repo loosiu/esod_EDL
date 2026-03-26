@@ -1,8 +1,13 @@
 # train and val data as 1) directory: path/images/, 2) file: path/images.txt, or 3) list: [path1/images/, path2/images/]
-train: ./VisDrone/split/train.txt  # 4K images
-val: ./VisDrone/split/val.txt  # 700 imageS
-test: ./VisDrone/split/test-dev.txt  # 20288 of 40670 images, submit to https:/competitions.codalab.org/competitions/20794
+# train: ./visdrone/split/train.txt  # 4K images
+# val: ./visdrone/split/val.txt  # 700 imageS
+# # test: ./VisDrone/split/test-dev.txt  # 20288 of 40670 images, submit to https:/competitions.codalab.org/competitions/20794
+# test: /data/siwoo/esod_multipatch/esod/visdrone/test/images/
 
+
+train: /data/siwoo/esod/esod/visdrone/split/train.txt
+val: /data/siwoo/esod/esod/visdrone/split/val.txt
+test: /data/siwoo/esod/esod/visdrone/split/test.txt
 # number of classes
 nc: 10
 
