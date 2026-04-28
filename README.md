@@ -13,6 +13,7 @@ foreground/background evidence estimation and an EDL-based objectness loss.
 - Replaced the standard objectness BCE loss with an EDL-based loss
 - Used evidential objectness to improve heatmap reliability for patch selection
 
+<!-- 
 ## Installation
 
 [**Python>=3.6.0**](https://www.python.org/) is required with all
@@ -205,5 +206,5 @@ If you find this work useful in your research, please kindly cite the paper:
     year={2025}
 }
 ```
-
+-->
 
