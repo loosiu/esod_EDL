@@ -1,4 +1,5 @@
 # ESOD-EDL: Evidential Objectness for Efficient Small Object Detection
+Open-Set Object Detection
 
 This repository is based on the official implementation of 
 [ESOD: Efficient Small Object Detection on High-Resolution Images](https://arxiv.org/abs/2407.16424),
