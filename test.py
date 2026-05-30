@@ -118,6 +118,7 @@ def test(data,
     p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
     loss = torch.zeros(6, device=device)
     statistic_items = torch.zeros(3, device=device, dtype=torch.float32)
+    statistic_items_ctr = torch.zeros(3, device=device, dtype=torch.float32)   # BPR_ctr (cluster_recall mode='point')
     jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
     sp_r, m_p, m_r, attr = [], [], [], []
     gflops, infer_times = [], []
@@ -197,7 +198,8 @@ def test(data,
         if isinstance(p_det, tuple):
             clusters = p_det[1][0] if p_det is not None else torch.zeros((0, 5), device=device)
             clusters = [clusters[clusters[:, 0] == bi, 1:] for bi in range(nb)]
-            statistic_items += cluster_recall(clusters, targets, imgsz=(width, height), mode='bbox')
+            statistic_items     += cluster_recall(clusters, targets, imgsz=(width, height), mode='bbox')
+            statistic_items_ctr += cluster_recall(clusters, targets, imgsz=(width, height), mode='point')
             patch_quality_update(clusters, targets, patch_stats)
             if not training and opt.task == 'measure':
                 lbucket.add(len(clusters[0]), gflops[-1], infer_times[-1])
@@ -336,13 +338,44 @@ def test(data,
         avg_patches = patch_stats['total_patches'] / max(seen, 1)
         avg_bg = patch_stats['bg_patches'] / max(seen, 1)
         avg_fg = avg_patches - avg_bg
+        # ESOD Eq.7 — BPR_box (IoS-based) vs BPR_ctr (center-in-patch)
+        # statistic_items[0] = tp_box, statistic_items_ctr[0] = tp_ctr; both share the same N_GT total
+        try:
+            n_gt = float(patch_stats['obj_total'])
+            bpr_box = float(statistic_items[0]) / max(n_gt, 1.0)
+            bpr_ctr = float(statistic_items_ctr[0]) / max(n_gt, 1.0)
+        except Exception:
+            bpr_box = bpr_ctr = float('nan')
         print('\n[Patch Quality]')
         print('  %-20s %.4f' % ('Patch Recall',     pq['patch_recall']))
         print('  %-20s %.4f' % ('GT Coverage',      pq['gt_coverage']))
         print('  %-20s %.4f' % ('BG Patch Ratio',   pq['bg_patch_ratio']))
         print('  %-20s %.1f' % ('Avg Patches/Image', avg_patches))
         print('  %-20s %.1f (FG) + %.1f (BG)' % ('  Breakdown', avg_fg, avg_bg))
+        print('  %-20s %.4f   (ESOD Eq.7, IoS≥0.5)' % ('BPR_box',  bpr_box))
+        print('  %-20s %.4f   (ESOD Eq.7, GT-center in patch)' % ('BPR_ctr', bpr_ctr))
 
+    # COCO-style size-stratified mAP (AP_s/AP_m/AP_l) — addresses prof's small-object check
+    if getattr(opt, 'ap_size', False):
+        try:
+            from utils.coco_size_eval import build_coco_gt_from_dataloader, run_coco_size_eval
+            class_names = list(model.names) if hasattr(model, 'names') else list(model.module.names)
+            print('\n[AP-size] Building on-the-fly COCO GT from val labels...')
+            coco_gt = build_coco_gt_from_dataloader(dataloader, class_names)
+            print(f'[AP-size] {len(coco_gt["images"])} images, {len(coco_gt["annotations"])} annotations')
+            # Need predictions in jdict format — collect from existing test outputs.
+            # If --save-json was off, build a minimal jdict from `stats` is hard;
+            # instead require user to also pass --save-json. Warn if jdict empty.
+            if not jdict:
+                print('[AP-size] WARNING: jdict empty — add --save-json to enable size-stratified mAP')
+            else:
+                size_metrics = run_coco_size_eval(coco_gt, jdict)
+                print('\n[AP-size] Summary')
+                for k in ('AP', 'AP50', 'AP75', 'AP_s', 'AP_m', 'AP_l',
+                          'AR_1', 'AR_10', 'AR_100', 'AR_s', 'AR_m', 'AR_l'):
+                    print('  %-8s %.4f' % (k, size_metrics[k]))
+        except Exception as e:
+            print(f'[AP-size] failed: {e}')
 
     # Print results
     pf = '%20s' + '%11i' * 2 + '%11.3g' * 6  # print format
@@ -444,6 +477,7 @@ if __name__ == '__main__':
     parser.add_argument('--save-hybrid', action='store_true', help='save label+prediction hybrid results to *.txt')
     parser.add_argument('--save-conf', action='store_true', help='save confidences in --save-txt labels')
     parser.add_argument('--save-json', action='store_true', help='save a cocoapi-compatible JSON results file')
+    parser.add_argument('--ap-size', action='store_true', help='compute COCO-style AP_s/AP_m/AP_l with on-the-fly GT (requires --save-json)')
     parser.add_argument('--project', default='runs/test', help='save to project/name')
     parser.add_argument('--name', default='exp', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
