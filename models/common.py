@@ -639,6 +639,59 @@ class MaskedTransformerBlock(nn.Module):
 #         return patches, self.grid_off
 
 
+def _get_vac_norm_mode():
+    """ESOD_VAC_NORM env: how to normalize V before being used in OR-style fusion.
+    - 'raw'          : V_norm = V (= 2/S) as-is. Risk: V tends to live in the upper half of [0,1]
+                        for under-trained pixels → (1-V) is small everywhere → OR saturates.
+    - 'minmax_img'   : per-image min-max → V_norm = (V - V_min[bi]) / (V_max[bi] - V_min[bi] + eps)
+    - 'minmax_batch' : per-batch min-max (single statistic across whole batch)
+    - 'sigmoid'      : sigmoid((V - V.median) / temp)  with temp=0.1 (smooth re-centering)
+    - 'percentile'   : per-image rank → V_norm = rank(V) / N  (forces uniform [0,1])
+    Default = 'minmax_img' (the most common and least disruptive normalization).
+    """
+    return os.environ.get('ESOD_VAC_NORM', 'minmax_img').strip().lower()
+
+
+def normalize_vacuity(v, mode=None, eps=1e-6):
+    """Normalize vacuity v of shape [B,H,W] (or [B,1,H,W]) → same shape, broadly in [0,1].
+
+    Modes mirror _get_vac_norm_mode docstring. Used in OR-style fusion variants only.
+    """
+    if mode is None:
+        mode = _get_vac_norm_mode()
+
+    if mode == 'raw':
+        return v
+    if v.dim() == 4:
+        v_flat = v.flatten(1)        # [B, H*W]
+        squeezed_back = True
+    else:
+        v_flat = v.flatten(1)        # [B, H*W]
+        squeezed_back = False
+    B = v_flat.shape[0]
+
+    if mode == 'minmax_img':
+        v_min = v_flat.min(dim=1, keepdim=True).values
+        v_max = v_flat.max(dim=1, keepdim=True).values
+        v_n = (v_flat - v_min) / (v_max - v_min + eps)
+    elif mode == 'minmax_batch':
+        v_min = v_flat.min()
+        v_max = v_flat.max()
+        v_n = (v_flat - v_min) / (v_max - v_min + eps)
+    elif mode == 'sigmoid':
+        med = v_flat.median(dim=1, keepdim=True).values
+        v_n = torch.sigmoid((v_flat - med) / 0.1)
+    elif mode == 'percentile':
+        # rank-based: convert each element to its rank fraction within the image
+        rank = v_flat.argsort(dim=1).argsort(dim=1).float()
+        v_n = rank / max(v_flat.shape[1] - 1, 1)
+    else:
+        raise ValueError(f"Unknown ESOD_VAC_NORM mode: {mode}")
+
+    out = v_n.view_as(v)
+    return out.clamp(0.0, 1.0)
+
+
 def _view_from_2ch_evidence(raw_2ch, eps=1e-6):
     """Convert a 2-ch evidence-logit tensor to a binary subjective-logic view.
 
@@ -734,11 +787,15 @@ def parse_dual_4ch(mask_raw, fusion_mode='dempster', eps=1e-6):
     if fusion_mode == 'dempster':
         mask_pred = b_a_obj.clamp(0.0, 1.0)
     elif fusion_mode == 'noisy_or':
+        # F = 1 - (1 - p_h_obj)(1 - p_e_obj). Both probs already in [0,1], no V-norm needed.
         mask_pred = (1.0 - (1.0 - view_h['p_obj']) * (1.0 - view_e['p_obj'])).clamp(0.0, 1.0)
     elif fusion_mode == 'noisy_or_vac':
-        mask_pred = (1.0 - (1.0 - view_h['p_obj']) * (1.0 - view_e['u'])).clamp(0.0, 1.0)
+        # F = 1 - (1 - p_h_obj)(1 - V_norm), per user's 3-B-a formula
+        v_norm = normalize_vacuity(view_e['u'])
+        mask_pred = (1.0 - (1.0 - view_h['p_obj']) * (1.0 - v_norm)).clamp(0.0, 1.0)
     elif fusion_mode == 'product':
-        mask_pred = (view_h['p_obj'] * (1.0 - view_e['u'])).clamp(0.0, 1.0)
+        v_norm = normalize_vacuity(view_e['u'])
+        mask_pred = (view_h['p_obj'] * (1.0 - v_norm)).clamp(0.0, 1.0)
     elif fusion_mode == 'heat_only':
         mask_pred = view_h['p_obj']
     elif fusion_mode == 'edl_only':
@@ -760,8 +817,67 @@ def parse_dual_4ch(mask_raw, fusion_mode='dempster', eps=1e-6):
     }
 
 
-# Back-compat alias (older callers used parse_dual_3ch name)
-parse_dual_3ch = parse_dual_4ch
+def parse_dual_3ch(mask_raw, fusion_mode='noisy_or_vac', eps=1e-6):
+    """3-channel BCE-heat + EDL dual head — used by 3-B variants (heatmap branch unchanged).
+
+    mask_raw: [B,3,H,W]
+        ch 0   = Heat logit (BCE-trained, sigmoid → probability H)
+        ch 1-2 = EDL Dirichlet evidence logits (Softplus → α; vacuity V = 2/S)
+
+    fusion_mode (default 'noisy_or_vac' = user's 3-B-a formula):
+      - 'noisy_or_vac': F = 1 - (1 - H)(1 - V_norm)     [3-B-a, REQUIRES V normalization]
+      - 'noisy_or':     F = 1 - (1 - H)(1 - p_e_obj)    [variant using EDL prob instead of V]
+      - 'product':      F = H * (1 - V_norm)            [legacy failing dual]
+      - 'heat_only':    F = H                            (ablation)
+      - 'edl_only':     F = V_raw                        (ablation)
+      - 'dempster':     TMC-lite — H cast to (b,u) via entropy heuristic u_h=4H(1-H),
+                         then strict DS_Combin. Less faithful than 4-ch Full TMC.
+    Heat branch is BCE-trained (NOT a Dirichlet), so combined α_a supervision is N/A here.
+    """
+    heat_logit = mask_raw[:, 0:1]
+    edl_raw    = mask_raw[:, 1:3]
+
+    heat_p = heat_logit.sigmoid().squeeze(1)          # H ∈ [0,1]
+    view_e = _view_from_2ch_evidence(edl_raw, eps=eps)
+    vacuity_raw = view_e['u']                         # V = 2/S
+
+    if fusion_mode == 'noisy_or_vac':
+        v_norm = normalize_vacuity(vacuity_raw)
+        mask_pred = (1.0 - (1.0 - heat_p) * (1.0 - v_norm)).clamp(0.0, 1.0)
+    elif fusion_mode == 'noisy_or':
+        mask_pred = (1.0 - (1.0 - heat_p) * (1.0 - view_e['p_obj'])).clamp(0.0, 1.0)
+        v_norm = vacuity_raw   # unused for this mode but kept for return-dict shape
+    elif fusion_mode == 'product':
+        v_norm = normalize_vacuity(vacuity_raw)
+        mask_pred = (heat_p * (1.0 - v_norm)).clamp(0.0, 1.0)
+    elif fusion_mode == 'heat_only':
+        mask_pred = heat_p
+        v_norm = vacuity_raw
+    elif fusion_mode == 'edl_only':
+        mask_pred = vacuity_raw
+        v_norm = vacuity_raw
+    elif fusion_mode == 'dempster':
+        # TMC-lite: cast Heat to (b_h, u_h) via entropy. Less faithful than 4-ch Full TMC.
+        u_h = (4.0 * heat_p * (1.0 - heat_p)).clamp(0.0, 1.0)
+        b_h_obj = heat_p * (1.0 - u_h)
+        b_h_bg  = (1.0 - heat_p) * (1.0 - u_h)
+        b_e_obj = view_e['b_obj']; b_e_bg = view_e['b_bg']; u_e = view_e['u']
+        C = b_h_bg * b_e_obj + b_h_obj * b_e_bg
+        one_minus_C = (1.0 - C).clamp(min=eps)
+        b_a_obj = (b_h_obj * b_e_obj + b_h_obj * u_e + b_e_obj * u_h) / one_minus_C
+        mask_pred = b_a_obj.clamp(0.0, 1.0)
+        v_norm = vacuity_raw
+    else:
+        raise ValueError(f"Unknown ESOD_FUSION_MODE for 3-ch: {fusion_mode}")
+
+    return {
+        'mask_pred': mask_pred.detach(),
+        'heat_p':    heat_p.detach(),
+        'edl_p':     view_e['p_obj'].detach(),
+        'vacuity':   vacuity_raw.detach(),
+        'v_norm':    v_norm.detach(),
+        'u':         vacuity_raw.detach(),  # for HeatMapParser debug log compatibility
+    }
 
 
 # Default thresholds per fusion mode (overridable by env ESOD_HM_THRES)
@@ -859,13 +975,21 @@ class HeatMapParser(nn.Module):
             vacuity = (2.0 / S).detach()
             mask_pred = vacuity               # prob 대신 vacuity를 사용
 
+        elif mask_raw.shape[1] == 3:
+            # DUAL 3-ch (3-B variants): ch0 = BCE heat logit, ch1-2 = EDL Dirichlet evidence
+            fusion_mode = _get_fusion_mode()
+            parsed = parse_dual_3ch(mask_raw, fusion_mode=fusion_mode)
+            mask_pred = parsed['mask_pred']
+            vacuity = parsed['vacuity']
+            eff_thres = _get_hm_thres(_FUSION_DEFAULT_THRES.get(fusion_mode, self.threshold))
+            self._eff_thres = eff_thres
+
         elif mask_raw.shape[1] == 4:
-            # Full TMC DUAL: ch0-1 = Heat Dirichlet evidence, ch2-3 = EDL Dirichlet evidence
+            # Full TMC DUAL 4-ch (3-A): ch0-1 = Heat Dirichlet evidence, ch2-3 = EDL Dirichlet evidence
             fusion_mode = _get_fusion_mode()
             parsed = parse_dual_4ch(mask_raw, fusion_mode=fusion_mode)
             mask_pred = parsed['mask_pred']
             vacuity = parsed['u']           # combined (fused) vacuity for downstream debug logging
-            # per-mode threshold override (only adjust if running default cfg threshold)
             eff_thres = _get_hm_thres(_FUSION_DEFAULT_THRES.get(fusion_mode, self.threshold))
             self._eff_thres = eff_thres
 

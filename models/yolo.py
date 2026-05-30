@@ -487,8 +487,13 @@ class Model(nn.Module):
                         _alpha = _ev + 1.0
                         _S = _alpha.sum(dim=1, keepdim=True)
                         heatmap = 2.0 / _S  # vacuity [B,1,H,W]
+                    elif _pm.shape[1] == 3:
+                        # 3-B variants DUAL 3-ch: BCE heat + EDL
+                        from models.common import parse_dual_3ch, _get_fusion_mode
+                        parsed = parse_dual_3ch(_pm, fusion_mode=_get_fusion_mode())
+                        heatmap = parsed['mask_pred'].unsqueeze(1)
                     elif _pm.shape[1] == 4:
-                        # Full-TMC DUAL: parse via the same fusion mode used by HeatMapParser
+                        # Full-TMC DUAL 4-ch (3-A): parse via the same fusion mode used by HeatMapParser
                         from models.common import parse_dual_4ch, _get_fusion_mode
                         parsed = parse_dual_4ch(_pm, fusion_mode=_get_fusion_mode())
                         heatmap = parsed['mask_pred'].unsqueeze(1)  # [B,1,H,W]

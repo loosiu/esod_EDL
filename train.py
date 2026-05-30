@@ -62,6 +62,10 @@ def edl_stats_one_batch(model, dataloader, device):
     if C == 2:
         edl_part = hm
         heat_p = None
+    elif C == 3:
+        # 3-B variants: ch0 = BCE heat logit, ch1-2 = EDL Dirichlet evidence
+        heat_p = hm[:, 0].sigmoid()
+        edl_part = hm[:, 1:3]
     elif C == 4:
         # Full-TMC DUAL: ch0-1 = Heat Dirichlet evidence, ch2-3 = EDL Dirichlet evidence
         from models.common import _view_from_2ch_evidence
@@ -69,7 +73,7 @@ def edl_stats_one_batch(model, dataloader, device):
         heat_p = v_h['p_obj']
         edl_part = hm[:, 2:4]
     else:
-        return {"ok": False, "heatmapC": int(C), "reason": "heatmapC not in {2,4}"}
+        return {"ok": False, "heatmapC": int(C), "reason": "heatmapC not in {2,3,4}"}
 
     evidence = F.softplus(edl_part)
     alpha = evidence + 1.0
@@ -97,11 +101,17 @@ def edl_stats_one_batch(model, dataloader, device):
         hf_ = hf - hf.mean()
         corr_hp = (hf_ * pf_).mean() / (hf_.std(unbiased=False) * pf_.std(unbiased=False) + 1e-12)
         corr_hv = (hf_ * vf_).mean() / (hf_.std(unbiased=False) * vf_.std(unbiased=False) + 1e-12)
+        # H and V percentiles (p10/p25/p50/p75/p90) for scale-mismatch diagnosis
+        q = torch.tensor([0.10, 0.25, 0.50, 0.75, 0.90], device=hf.device)
+        h_pct = torch.quantile(hf, q).tolist()
+        v_pct = torch.quantile(vf, q).tolist()
         out.update({
             "h_mean": float(heat_p.mean()),
             "h_max": float(heat_p.max()),
             "corr_hp": float(corr_hp.item()),
             "corr_hv": float(corr_hv.item()),
+            "h_pct": [f"{x:.3f}" for x in h_pct],   # [p10, p25, p50, p75, p90]
+            "v_pct": [f"{x:.3f}" for x in v_pct],
         })
     return out
     
@@ -483,10 +493,13 @@ def train(hyp, opt, device, tb_writer=None):
                             f"p_mean={edl_stats['p_mean']:.4f} p_max={edl_stats['p_max']:.4f} "
                             f"v_mean={edl_stats['v_mean']:.4f} v_max={edl_stats['v_max']:.4f} "
                             f"corr_pv={edl_stats['corr']:.4f}")
-                    if edl_stats['heatmapC'] == 3:
+                    if edl_stats['heatmapC'] in (3, 4):
                         base += (f" h_mean={edl_stats.get('h_mean', 0):.4f} h_max={edl_stats.get('h_max', 0):.4f} "
                                  f"corr_hp={edl_stats.get('corr_hp', 0):.4f} corr_hv={edl_stats.get('corr_hv', 0):.4f} "
-                                 f"fusion={os.environ.get('ESOD_FUSION_MODE', 'dempster')}")
+                                 f"fusion={os.environ.get('ESOD_FUSION_MODE', 'dempster')} "
+                                 f"vac_norm={os.environ.get('ESOD_VAC_NORM', 'minmax_img')}\n"
+                                 f"  H pct[10/25/50/75/90]={edl_stats.get('h_pct')}\n"
+                                 f"  V pct[10/25/50/75/90]={edl_stats.get('v_pct')}")
                     print(base)
                 else:
                     # EDL이 안 걸리면 이유까지 출력

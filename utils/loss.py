@@ -369,6 +369,17 @@ class ComputeLoss:
             ).reshape(1)
         elif Cch == 2:
             lpixl = self._compute_edl_pixl(p, masks, weight)
+        elif Cch == 3:
+            # 3-B variants: ch0 = BCE heat logit, ch1-2 = EDL Dirichlet evidence
+            # L = lam_h * BCE(ch0) + lam_e * EDL(ch1-2). No combined-α supervision (Heat not Dirichlet here).
+            import os as _os
+            lam_h = float(_os.environ.get('ESOD_DUAL_LAM_H', '1.0'))
+            lam_e = float(_os.environ.get('ESOD_DUAL_LAM_E', '1.0'))
+            l_heat = F.binary_cross_entropy_with_logits(
+                p[:, 0:1], masks, weight=weight, reduction='mean'
+            )
+            l_edl  = self._compute_edl_pixl(p[:, 1:3], masks, weight).squeeze(0)
+            lpixl = (lam_h * l_heat + lam_e * l_edl).reshape(1)
         elif Cch == 4:
             import os as _os
             lam_h = float(_os.environ.get('ESOD_DUAL_LAM_H', '1.0'))
