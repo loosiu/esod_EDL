@@ -410,8 +410,16 @@ class ComputeLoss:
                     view_e = _view_from_2ch_evidence(p[:, 1:3])
                     v_norm = normalize_vacuity(view_e['u']).unsqueeze(1)
                     alpha_g = p[:, 3:4].sigmoid()
-                    F_fused = (alpha_g * heat_p + (1.0 - alpha_g) * v_norm).clamp(1e-6, 1.0 - 1e-6)
-                    l_f = F.binary_cross_entropy(F_fused, masks, weight=weight, reduction='mean')
+                    F_fused = (alpha_g * heat_p + (1.0 - alpha_g) * v_norm)
+                    # Manual BCE on probabilities — F.binary_cross_entropy is autocast-unsafe
+                    # under fp16 mixed precision. F_fused is NOT a logit (it's a blend of two
+                    # sigmoid outputs), so binary_cross_entropy_with_logits cannot be used either.
+                    # Manual log()+clamp is numerically stable under autocast.
+                    F_safe = F_fused.clamp(1e-6, 1.0 - 1e-6)
+                    bce = -(masks * F_safe.log() + (1.0 - masks) * (1.0 - F_safe).log())  # [B,1,H,W]
+                    if weight is not None:
+                        bce = bce * weight
+                    l_f = bce.mean()
                 else:
                     l_f = torch.zeros(1, device=device).squeeze(0)
 
