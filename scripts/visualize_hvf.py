@@ -83,12 +83,22 @@ def extract_maps(pred_masks_0):
         V = parsed['vacuity'].cpu().numpy()[0]
         Fm = parsed['mask_pred'].cpu().numpy()[0]
     elif C == 4:
-        # 3-A Full TMC dual: ch0-1 = Heat Dirichlet, ch2-3 = EDL Dirichlet
-        from models.common import parse_dual_4ch, _get_fusion_mode
-        parsed = parse_dual_4ch(pm, fusion_mode=_get_fusion_mode())
-        H = parsed['heat_p'].cpu().numpy()[0]
-        V = parsed['edl_vac'].cpu().numpy()[0]
-        Fm = parsed['mask_pred'].cpu().numpy()[0]
+        from models.common import parse_dual_4ch, parse_dual_4ch_gating, _get_fusion_mode
+        _fm = _get_fusion_mode()
+        if _fm == 'gating':
+            # 3-B-b SegmenterWithGating: ch0=BCE heat, ch1-2=EDL Dirichlet, ch3=gating logit
+            parsed = parse_dual_4ch_gating(pm)
+            H = parsed['heat_p'].cpu().numpy()[0]
+            V = parsed['vacuity'].cpu().numpy()[0]
+            Fm = parsed['mask_pred'].cpu().numpy()[0]
+            alpha = parsed['alpha'].cpu().numpy()[0]
+            return {'H': H, 'V': V, 'F': Fm, 'alpha': alpha, 'C': C, 'mode': 'gating'}
+        else:
+            # 3-A Full TMC dual: ch0-1 = Heat Dirichlet, ch2-3 = EDL Dirichlet
+            parsed = parse_dual_4ch(pm, fusion_mode=_fm)
+            H = parsed['heat_p'].cpu().numpy()[0]
+            V = parsed['edl_vac'].cpu().numpy()[0]
+            Fm = parsed['mask_pred'].cpu().numpy()[0]
     else:
         raise ValueError(f"Unsupported Segmenter channels: {C}")
 
@@ -96,10 +106,12 @@ def extract_maps(pred_masks_0):
 
 
 def plot_panel(img_uint8, maps, out_path, title):
-    """Plot input | H | V | F in one row + H/V histogram overlay below."""
+    """Plot input | H | V | F (| α if available) in one row + distribution overlay below."""
     H, V, Fm = maps['H'], maps['V'], maps['F']
-    fig = plt.figure(figsize=(20, 6))
-    gs = fig.add_gridspec(2, 4, height_ratios=[3, 1.2])
+    alpha = maps.get('alpha', None)
+    n_cols = 5 if alpha is not None else 4
+    fig = plt.figure(figsize=(5 * n_cols, 6))
+    gs = fig.add_gridspec(2, n_cols, height_ratios=[3, 1.2])
 
     ax0 = fig.add_subplot(gs[0, 0]); ax0.imshow(img_uint8); ax0.set_title('input'); ax0.axis('off')
     # Same vmin/vmax 0..1 across maps so a pixel value of 0.5 looks identical in H/V/F
@@ -122,15 +134,24 @@ def plot_panel(img_uint8, maps, out_path, title):
     ax3.set_title(f'F  (mean={Fm.mean():.3f}, p50={np.median(Fm):.3f})'); ax3.axis('off')
     fig.colorbar(im3, ax=ax3, fraction=0.046)
 
-    # Histogram overlay (H vs V) — addresses professor's distribution-comparison check
+    if alpha is not None:
+        ax4 = fig.add_subplot(gs[0, 4])
+        im4 = ax4.imshow(alpha, vmin=0, vmax=1, cmap=cmap)
+        ax4.set_title(f'α-gate  (mean={alpha.mean():.3f}, p50={np.median(alpha):.3f})'); ax4.axis('off')
+        fig.colorbar(im4, ax=ax4, fraction=0.046)
+
+    # Histogram overlay — addresses prof's distribution-comparison check + α saturation check
     axh = fig.add_subplot(gs[1, :])
     bins = np.linspace(0, 1, 51)
     axh.hist(H.flatten(), bins=bins, alpha=0.5, label='H', color='C0', density=True)
     if V is not None:
         axh.hist(V.flatten(), bins=bins, alpha=0.5, label='V', color='C3', density=True)
     axh.hist(Fm.flatten(), bins=bins, alpha=0.4, label='F', color='C2', histtype='step', linewidth=2, density=True)
+    if alpha is not None:
+        axh.hist(alpha.flatten(), bins=bins, alpha=0.4, label='α-gate', color='C4', histtype='step', linewidth=2, density=True)
     axh.set_xlim(0, 1); axh.set_xlabel('value'); axh.set_ylabel('density')
-    axh.set_title(f'H vs V vs F distribution  (V saturated near 1.0 → KL/EDL diagnosis)')
+    title_hint = '(α: saturate 0/1 → hard switch; concentrate 0.5 → mere average)' if alpha is not None else '(V saturated near 1.0 → KL/EDL diagnosis)'
+    axh.set_title(f'H vs V vs F vs α distribution  {title_hint}')
     axh.legend()
 
     fig.suptitle(title)
@@ -175,7 +196,7 @@ def main(opt):
     save_dir = increment_path(Path('runs/visualize') / opt.name, exist_ok=opt.exist_ok)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    all_H, all_V, all_F = [], [], []
+    all_H, all_V, all_F, all_A = [], [], [], []
     fusion_mode = os.environ.get('ESOD_FUSION_MODE', 'dempster')
     vac_norm    = os.environ.get('ESOD_VAC_NORM', 'minmax_img')
     print(f'[viz] fusion_mode={fusion_mode}  vac_norm={vac_norm}  save_dir={save_dir}')
@@ -202,11 +223,14 @@ def main(opt):
             if maps['V'] is not None:
                 all_V.append(maps['V'].flatten())
             all_F.append(maps['F'].flatten())
+            if maps.get('alpha') is not None:
+                all_A.append(maps['alpha'].flatten())
             print(f'  saved {out.name}')
 
     all_H = np.concatenate(all_H) if all_H else np.array([])
     all_V = np.concatenate(all_V) if all_V else np.array([])
     all_F = np.concatenate(all_F) if all_F else np.array([])
+    all_A = np.concatenate(all_A) if all_A else np.array([])
 
     aggregate_histogram(all_H, all_V, all_F, save_dir / 'hist_aggregate.png',
                         title=f'Aggregate H/V/F over {opt.n_images} val images  |  fusion={fusion_mode}  vac_norm={vac_norm}')
@@ -217,9 +241,15 @@ def main(opt):
     summary = {
         'fusion_mode': fusion_mode, 'vac_norm': vac_norm,
         'n_images': int(opt.n_images),
-        'H_percentiles': pct(all_H),
-        'V_percentiles': pct(all_V),
-        'F_percentiles': pct(all_F),
+        'H_percentiles':     pct(all_H),
+        'V_percentiles':     pct(all_V),
+        'F_percentiles':     pct(all_F),
+        'alpha_percentiles': pct(all_A),
+        'alpha_saturation':  {
+            'frac_lt_0.1':  float((all_A < 0.1).mean()) if all_A.size else None,
+            'frac_gt_0.9':  float((all_A > 0.9).mean()) if all_A.size else None,
+            'frac_in_0.4_0.6': float(((all_A > 0.4) & (all_A < 0.6)).mean()) if all_A.size else None,
+        } if all_A.size else None,
     }
     with open(save_dir / 'hist_summary.yaml', 'w') as f:
         yaml.safe_dump(summary, f, default_flow_style=False)

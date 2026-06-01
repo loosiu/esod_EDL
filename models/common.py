@@ -817,6 +817,41 @@ def parse_dual_4ch(mask_raw, fusion_mode='dempster', eps=1e-6):
     }
 
 
+def parse_dual_4ch_gating(mask_raw, eps=1e-6):
+    """3-B-b: Learnable spatial-attention gating fusion (CBAM-style).
+
+    mask_raw: [B,4,H,W] from SegmenterWithGating
+        ch 0   = BCE heat logit
+        ch 1-2 = EDL Dirichlet evidence logits (bg, obj)
+        ch 3   = gating logit (sigmoid → α_gate ∈ [0,1])
+
+    Fusion: F(x,y) = α(x,y) · H(x,y) + (1 − α(x,y)) · V_norm(x,y)
+    where α is learned end-to-end via detection loss (no direct supervision),
+    per CBAM convention. Returns 'alpha' for distribution monitoring (prof's caveat).
+    """
+    heat_logit = mask_raw[:, 0:1]
+    edl_raw    = mask_raw[:, 1:3]
+    gate_logit = mask_raw[:, 3:4]
+
+    heat_p = heat_logit.sigmoid().squeeze(1)             # H
+    view_e = _view_from_2ch_evidence(edl_raw, eps=eps)
+    v_raw  = view_e['u']                                 # raw vacuity
+    v_norm = normalize_vacuity(v_raw)                    # V_norm (same env as 3-B-a)
+    alpha  = gate_logit.sigmoid().squeeze(1)             # α ∈ [0,1]
+
+    mask_pred = (alpha * heat_p + (1.0 - alpha) * v_norm).clamp(0.0, 1.0)
+
+    return {
+        'mask_pred': mask_pred.detach(),
+        'heat_p':    heat_p.detach(),
+        'edl_p':     view_e['p_obj'].detach(),
+        'vacuity':   v_raw.detach(),
+        'v_norm':    v_norm.detach(),
+        'alpha':     alpha.detach(),
+        'u':         v_raw.detach(),
+    }
+
+
 def parse_dual_3ch(mask_raw, fusion_mode='noisy_or_vac', eps=1e-6):
     """3-channel BCE-heat + EDL dual head — used by 3-B variants (heatmap branch unchanged).
 
@@ -888,6 +923,7 @@ _FUSION_DEFAULT_THRES = {
     'product':      0.30,
     'heat_only':    0.50,
     'edl_only':     0.15,  # legacy EDL-only setting
+    'gating':       0.50,  # 3-B-b: F = α·H + (1−α)·V_norm is a prob-like quantity → 0.5 default
 }
 
 
@@ -985,11 +1021,16 @@ class HeatMapParser(nn.Module):
             self._eff_thres = eff_thres
 
         elif mask_raw.shape[1] == 4:
-            # Full TMC DUAL 4-ch (3-A): ch0-1 = Heat Dirichlet evidence, ch2-3 = EDL Dirichlet evidence
+            # 4-ch DUAL — two flavors distinguished by ESOD_FUSION_MODE:
+            #  - 'gating' (3-B-b SegmenterWithGating): ch0=BCE heat, ch1-2=EDL evidence, ch3=gating logit
+            #  - other   (3-A Full TMC Segmenter[4]):  ch0-1=Heat Dirichlet, ch2-3=EDL Dirichlet
             fusion_mode = _get_fusion_mode()
-            parsed = parse_dual_4ch(mask_raw, fusion_mode=fusion_mode)
+            if fusion_mode == 'gating':
+                parsed = parse_dual_4ch_gating(mask_raw)
+            else:
+                parsed = parse_dual_4ch(mask_raw, fusion_mode=fusion_mode)
             mask_pred = parsed['mask_pred']
-            vacuity = parsed['u']           # combined (fused) vacuity for downstream debug logging
+            vacuity = parsed['u']           # debug-print compatibility
             eff_thres = _get_hm_thres(_FUSION_DEFAULT_THRES.get(fusion_mode, self.threshold))
             self._eff_thres = eff_thres
 

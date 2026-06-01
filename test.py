@@ -175,9 +175,13 @@ def test(data,
                 _p = parsed['mask_pred'].unsqueeze(1).clamp(1e-6, 1 - 1e-6)
                 hm_1ch = torch.log(_p / (1.0 - _p))
             elif hm_raw.shape[1] == 4:
-                # Full-TMC DUAL 4-ch (3-A): use the fused mask_pred from the active ESOD_FUSION_MODE; convert to logit.
-                from models.common import parse_dual_4ch, _get_fusion_mode
-                parsed = parse_dual_4ch(hm_raw, fusion_mode=_get_fusion_mode())
+                # 4-ch DUAL: 'gating' = 3-B-b, else 3-A Full TMC
+                from models.common import parse_dual_4ch, parse_dual_4ch_gating, _get_fusion_mode
+                _fm = _get_fusion_mode()
+                if _fm == 'gating':
+                    parsed = parse_dual_4ch_gating(hm_raw)
+                else:
+                    parsed = parse_dual_4ch(hm_raw, fusion_mode=_fm)
                 _p = parsed['mask_pred'].unsqueeze(1).clamp(1e-6, 1 - 1e-6)
                 hm_1ch = torch.log(_p / (1.0 - _p))
             else:

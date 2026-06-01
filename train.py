@@ -67,13 +67,25 @@ def edl_stats_one_batch(model, dataloader, device):
         heat_p = hm[:, 0].sigmoid()
         edl_part = hm[:, 1:3]
     elif C == 4:
-        # Full-TMC DUAL: ch0-1 = Heat Dirichlet evidence, ch2-3 = EDL Dirichlet evidence
-        from models.common import _view_from_2ch_evidence
-        v_h = _view_from_2ch_evidence(hm[:, 0:2])
-        heat_p = v_h['p_obj']
-        edl_part = hm[:, 2:4]
+        # Two flavors of 4-ch — distinguished by ESOD_FUSION_MODE:
+        #  - 'gating' (3-B-b): ch0 = BCE heat logit, ch1-2 = EDL Dirichlet, ch3 = gating logit
+        #  - other   (3-A Full TMC): ch0-1 = Heat Dirichlet, ch2-3 = EDL Dirichlet
+        fusion_mode_ = os.environ.get('ESOD_FUSION_MODE', 'dempster').strip().lower()
+        if fusion_mode_ == 'gating':
+            heat_p = hm[:, 0].sigmoid()
+            edl_part = hm[:, 1:3]
+            gate_alpha = hm[:, 3].sigmoid()        # α ∈ [0,1] for saturation check
+        else:
+            from models.common import _view_from_2ch_evidence
+            v_h = _view_from_2ch_evidence(hm[:, 0:2])
+            heat_p = v_h['p_obj']
+            edl_part = hm[:, 2:4]
+            gate_alpha = None
     else:
         return {"ok": False, "heatmapC": int(C), "reason": "heatmapC not in {2,3,4}"}
+    # Initialize gate_alpha for non-4-ch paths
+    if C != 4:
+        gate_alpha = None
 
     evidence = F.softplus(edl_part)
     alpha = evidence + 1.0
@@ -112,6 +124,19 @@ def edl_stats_one_batch(model, dataloader, device):
             "corr_hv": float(corr_hv.item()),
             "h_pct": [f"{x:.3f}" for x in h_pct],   # [p10, p25, p50, p75, p90]
             "v_pct": [f"{x:.3f}" for x in v_pct],
+        })
+    if gate_alpha is not None:
+        # 3-B-b α-gate diagnostics — addresses prof's concern about saturation at 0/1 or 0.5
+        af = gate_alpha.flatten().float()
+        q_a = torch.tensor([0.10, 0.25, 0.50, 0.75, 0.90], device=af.device)
+        a_pct = torch.quantile(af, q_a).tolist()
+        out.update({
+            "alpha_mean":     float(gate_alpha.mean()),
+            "alpha_std":      float(gate_alpha.std()),
+            "alpha_pct":      [f"{x:.3f}" for x in a_pct],
+            "alpha_sat_low":  float((gate_alpha < 0.1).float().mean()),    # fraction near 0
+            "alpha_sat_high": float((gate_alpha > 0.9).float().mean()),    # fraction near 1
+            "alpha_neutral":  float(((gate_alpha > 0.4) & (gate_alpha < 0.6)).float().mean()),  # fraction near 0.5
         })
     return out
     
@@ -500,6 +525,12 @@ def train(hyp, opt, device, tb_writer=None):
                                  f"vac_norm={os.environ.get('ESOD_VAC_NORM', 'minmax_img')}\n"
                                  f"  H pct[10/25/50/75/90]={edl_stats.get('h_pct')}\n"
                                  f"  V pct[10/25/50/75/90]={edl_stats.get('v_pct')}")
+                    if edl_stats.get('alpha_mean') is not None:
+                        base += (f"\n  α-gate mean={edl_stats['alpha_mean']:.3f} std={edl_stats['alpha_std']:.3f} "
+                                 f"pct[10/25/50/75/90]={edl_stats.get('alpha_pct')}\n"
+                                 f"  α-gate saturation: low(<0.1)={edl_stats['alpha_sat_low']:.3f} "
+                                 f"high(>0.9)={edl_stats['alpha_sat_high']:.3f} "
+                                 f"neutral(0.4-0.6)={edl_stats['alpha_neutral']:.3f}")
                     print(base)
                 else:
                     # EDL이 안 걸리면 이유까지 출력

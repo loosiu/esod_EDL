@@ -232,10 +232,81 @@ class Segmenter(nn.Module):
     def __init__(self, nc=10, ch=()):
         super(Segmenter, self).__init__()
         self.m = nn.ModuleList(nn.Conv2d(x, nc, 1) for x in ch)  # output conv
-    
+
     def forward(self, x):
         return [self.m[i](x[i]) for i in range(len(x))]
-    
+
+
+class SegmenterWithGating(nn.Module):
+    """3-B-b: Segmenter with learnable spatial-attention gating head (CBAM-style).
+
+    Output is a 4-channel tensor per level:
+        ch 0   : heat logit (BCE-trained, sigmoid → H ∈ [0,1])
+        ch 1-2 : EDL Dirichlet evidence logits (Softplus → α, vacuity V = 2/S)
+        ch 3   : gating logit (sigmoid → α_gate ∈ [0,1])
+
+    The gating head takes [H, V_norm, F^S] (3-channel feature map) as input,
+    where F^S = noisy-OR static fusion `1 - (1 - H)(1 - V_norm)`, and feeds it
+    through a small CBAM-spatial-attention block (1x1 conv → ReLU → 1x1 conv).
+
+    Initialization: last conv's weight and bias are zeroed so α_gate starts at
+    sigmoid(0) = 0.5 — i.e., equal weighting of H and V_norm at the start. The
+    gating is trained end-to-end via detection loss (no direct supervision on α),
+    matching CBAM's design. Per the professor's caveat, watch for saturation: α
+    pinned near 0/1 (becomes hard switch) or stuck at 0.5 (mere averaging).
+    """
+    def __init__(self, nc=4, ch=(), hidden=8):
+        super(SegmenterWithGating, self).__init__()
+        assert nc == 4, f'SegmenterWithGating expects nc=4 (got {nc})'
+        # Per-level 1x1 conv producing the 3-channel seg output (heat + EDL bg/obj)
+        self.m = nn.ModuleList(nn.Conv2d(x, 3, 1) for x in ch)
+        # Shared CBAM-style spatial-attention gating block (operates on [H, V_norm, F^S])
+        self.gate = nn.Sequential(
+            nn.Conv2d(3, hidden, kernel_size=1, padding=0),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, 1, kernel_size=1, padding=0),
+        )
+        # Initialize last conv to zero so initial gating α starts at sigmoid(0)=0.5
+        nn.init.zeros_(self.gate[-1].weight)
+        nn.init.zeros_(self.gate[-1].bias)
+        # Track stats for monitoring (set during forward in train mode)
+        self.last_alpha_stats = None
+
+    def forward(self, x):
+        outs = []
+        for i, xi in enumerate(x):
+            seg3 = self.m[i](xi)                       # [B,3,H,W]: heat | edl_bg | edl_obj
+            heat_p = seg3[:, 0:1].sigmoid()            # H ∈ [0,1]
+            # V_norm computed inline (per-image min-max) so gating input matches what the fusion sees
+            edl_raw = seg3[:, 1:3]
+            e = F.softplus(edl_raw)
+            alpha_d = e + 1.0
+            S = alpha_d.sum(dim=1, keepdim=True)
+            V = 2.0 / S                                # raw vacuity [B,1,H,W]
+            B, _, Hh, Ww = V.shape
+            V_flat = V.view(B, -1)
+            V_min = V_flat.min(dim=1, keepdim=True).values.view(B, 1, 1, 1)
+            V_max = V_flat.max(dim=1, keepdim=True).values.view(B, 1, 1, 1)
+            V_norm = ((V - V_min) / (V_max - V_min + 1e-6)).clamp(0.0, 1.0)
+            F_static = 1.0 - (1.0 - heat_p) * (1.0 - V_norm)   # noisy-OR "static" fusion
+            gate_in = torch.cat([heat_p, V_norm, F_static], dim=1)  # [B,3,H,W]
+            gate_logit = self.gate(gate_in)            # [B,1,H,W]
+            full = torch.cat([seg3, gate_logit], dim=1)   # [B,4,H,W]
+            outs.append(full)
+            # Track α statistics (only for the first level, last batch — used by train.py logger)
+            if i == 0:
+                alpha = gate_logit.detach().sigmoid()
+                self.last_alpha_stats = {
+                    'mean': float(alpha.mean()),
+                    'std':  float(alpha.std()),
+                    'min':  float(alpha.min()),
+                    'max':  float(alpha.max()),
+                    'frac_sat_low':  float((alpha < 0.1).float().mean()),
+                    'frac_sat_high': float((alpha > 0.9).float().mean()),
+                    'frac_neutral':  float(((alpha > 0.4) & (alpha < 0.6)).float().mean()),
+                }
+        return outs
+
 
 class Center(nn.Module):
     def __init__(self, nc=80, ch=()):  # detection layer
@@ -463,7 +534,7 @@ class Model(nn.Module):
             
             x = m(x)  # run
 
-            if isinstance(m, Segmenter):
+            if isinstance(m, (Segmenter, SegmenterWithGating)):
                 pred_masks = x
                 if hm_only:
                     return (None, None), pred_masks
@@ -493,9 +564,13 @@ class Model(nn.Module):
                         parsed = parse_dual_3ch(_pm, fusion_mode=_get_fusion_mode())
                         heatmap = parsed['mask_pred'].unsqueeze(1)
                     elif _pm.shape[1] == 4:
-                        # Full-TMC DUAL 4-ch (3-A): parse via the same fusion mode used by HeatMapParser
-                        from models.common import parse_dual_4ch, _get_fusion_mode
-                        parsed = parse_dual_4ch(_pm, fusion_mode=_get_fusion_mode())
+                        # 4-ch DUAL: 'gating' = 3-B-b (SegmenterWithGating), else 3-A Full TMC
+                        from models.common import parse_dual_4ch, parse_dual_4ch_gating, _get_fusion_mode
+                        _fm = _get_fusion_mode()
+                        if _fm == 'gating':
+                            parsed = parse_dual_4ch_gating(_pm)
+                        else:
+                            parsed = parse_dual_4ch(_pm, fusion_mode=_fm)
                         heatmap = parsed['mask_pred'].unsqueeze(1)  # [B,1,H,W]
                     else:
                         heatmap = _pm.sigmoid()
@@ -540,7 +615,7 @@ class Model(nn.Module):
                 mi.cls_pred.bias.data.fill_(math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum()))
 
         for m_ in self.model:
-            if str(m_.type) == 'models.yolo.Segmenter':  # stupid
+            if str(m_.type) in ('models.yolo.Segmenter', 'models.yolo.SegmenterWithGating'):
                 for mi in m_.m:
                     b = mi.bias.view(-1)
                     b.data += math.log(0.6 / (m.nc - 0.99) if cf is None else torch.log(cf / cf.sum()))  # cls
@@ -633,7 +708,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             c2 = sum([ch[x] for x in f])
         elif m in [Add, nn.Identity]:
             pass
-        elif m in [Detect, Segmenter]:  # Detect2 deprecated
+        elif m in [Detect, Segmenter, SegmenterWithGating]:  # Detect2 deprecated
             args.append([ch[x] for x in f])
             if len(args) > 1 and isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)

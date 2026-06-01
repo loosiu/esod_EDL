@@ -382,29 +382,65 @@ class ComputeLoss:
             lpixl = (lam_h * l_heat + lam_e * l_edl).reshape(1)
         elif Cch == 4:
             import os as _os
-            lam_h = float(_os.environ.get('ESOD_DUAL_LAM_H', '1.0'))
-            lam_e = float(_os.environ.get('ESOD_DUAL_LAM_E', '1.0'))
-            lam_a = float(_os.environ.get('ESOD_DUAL_LAM_A', '1.0'))
+            fusion_mode = _os.environ.get('ESOD_FUSION_MODE', 'dempster').strip().lower()
 
-            heat_raw = p[:, 0:2]
-            edl_raw  = p[:, 2:4]
+            if fusion_mode == 'gating':
+                # 3-B-b: SegmenterWithGating output
+                #   ch 0   = BCE heat logit       → BCE(ch0, mask)
+                #   ch 1-2 = EDL Dirichlet bg/obj → EDL(ch1-2, mask)
+                #   ch 3   = gating logit         → NO direct supervision on α itself.
+                # Auxiliary fusion supervision (lam_f * BCE(F, mask)) gives α an
+                # indirect gradient signal — α is shaped to make F match the mask, but
+                # is never explicitly told what value to take (preserves CBAM-spirit
+                # "no direct attention supervision"). Without this, α has zero gradient
+                # because patch-selection uses .detach() and is non-differentiable.
+                lam_h = float(_os.environ.get('ESOD_DUAL_LAM_H', '1.0'))
+                lam_e = float(_os.environ.get('ESOD_DUAL_LAM_E', '1.0'))
+                lam_f = float(_os.environ.get('ESOD_DUAL_LAM_F', '0.5'))
 
-            l_heat = self._compute_edl_pixl(heat_raw, masks, weight).squeeze(0)
-            l_edl  = self._compute_edl_pixl(edl_raw,  masks, weight).squeeze(0)
+                l_heat = F.binary_cross_entropy_with_logits(
+                    p[:, 0:1], masks, weight=weight, reduction='mean'
+                )
+                l_edl  = self._compute_edl_pixl(p[:, 1:3], masks, weight).squeeze(0)
 
-            if lam_a > 0:
-                # Build combined Dirichlet α_a via binary TMC DS_Combin, then apply EDL loss to it.
-                # (TMC TPAMI 2022 multi-task loss: sum of per-view + combined-view EDL loss.)
-                from models.common import _view_from_2ch_evidence, tmc_ds_combine_binary
-                v_h = _view_from_2ch_evidence(heat_raw)
-                v_e = _view_from_2ch_evidence(edl_raw)
-                combined = tmc_ds_combine_binary(v_h, v_e, K=2)
-                alpha_a = combined['alpha']                          # [B,2,H,W]
-                l_a = self._compute_edl_pixl_from_alpha(alpha_a, masks, weight).squeeze(0)
+                if lam_f > 0:
+                    # Build F = α·H + (1-α)·V_norm WITHOUT detach so gradient flows to α.
+                    from models.common import _view_from_2ch_evidence, normalize_vacuity
+                    heat_p = p[:, 0:1].sigmoid()
+                    view_e = _view_from_2ch_evidence(p[:, 1:3])
+                    v_norm = normalize_vacuity(view_e['u']).unsqueeze(1)
+                    alpha_g = p[:, 3:4].sigmoid()
+                    F_fused = (alpha_g * heat_p + (1.0 - alpha_g) * v_norm).clamp(1e-6, 1.0 - 1e-6)
+                    l_f = F.binary_cross_entropy(F_fused, masks, weight=weight, reduction='mean')
+                else:
+                    l_f = torch.zeros(1, device=device).squeeze(0)
+
+                lpixl = (lam_h * l_heat + lam_e * l_edl + lam_f * l_f).reshape(1)
             else:
-                l_a = torch.zeros(1, device=device).squeeze(0)
+                # 3-A Full TMC: ch 0-1 = Heat Dirichlet, ch 2-3 = EDL Dirichlet
+                lam_h = float(_os.environ.get('ESOD_DUAL_LAM_H', '1.0'))
+                lam_e = float(_os.environ.get('ESOD_DUAL_LAM_E', '1.0'))
+                lam_a = float(_os.environ.get('ESOD_DUAL_LAM_A', '1.0'))
 
-            lpixl = (lam_h * l_heat + lam_e * l_edl + lam_a * l_a).reshape(1)
+                heat_raw = p[:, 0:2]
+                edl_raw  = p[:, 2:4]
+
+                l_heat = self._compute_edl_pixl(heat_raw, masks, weight).squeeze(0)
+                l_edl  = self._compute_edl_pixl(edl_raw,  masks, weight).squeeze(0)
+
+                if lam_a > 0:
+                    # Build combined Dirichlet α_a via binary TMC DS_Combin, then apply EDL loss to it.
+                    # (TMC TPAMI 2022 multi-task loss: sum of per-view + combined-view EDL loss.)
+                    from models.common import _view_from_2ch_evidence, tmc_ds_combine_binary
+                    v_h = _view_from_2ch_evidence(heat_raw)
+                    v_e = _view_from_2ch_evidence(edl_raw)
+                    combined = tmc_ds_combine_binary(v_h, v_e, K=2)
+                    alpha_a = combined['alpha']                          # [B,2,H,W]
+                    l_a = self._compute_edl_pixl_from_alpha(alpha_a, masks, weight).squeeze(0)
+                else:
+                    l_a = torch.zeros(1, device=device).squeeze(0)
+
+                lpixl = (lam_h * l_heat + lam_e * l_edl + lam_a * l_a).reshape(1)
         else:
             raise ValueError(f"Unsupported segmenter channels: {Cch}")
 
