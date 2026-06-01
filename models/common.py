@@ -867,6 +867,19 @@ def parse_dual_3ch(mask_raw, fusion_mode='noisy_or_vac', eps=1e-6):
       - 'edl_only':     F = V_raw                        (ablation)
       - 'dempster':     TMC-lite — H cast to (b,u) via entropy heuristic u_h=4H(1-H),
                          then strict DS_Combin. Less faithful than 4-ch Full TMC.
+      - 'moe':          3-B-c Mixture-of-Experts with EVIDENCE-BASED soft routing
+                         (Han et al. TPAMI'22 Dynamic Evidential Fusion). Routing is a
+                         deterministic function of view confidences (NO learnable
+                         router), so the prof's classical-MoE concerns auto-resolve:
+                           • soft by construction → no Gumbel-Softmax needed
+                           • cannot collapse → no load-balancing loss needed
+                           • differentiable throughout (no discrete sampling)
+                         Per-pixel:
+                           c_H = 1 - 4·H·(1-H)           (H prediction sharpness)
+                           c_V = 1 - V_raw                (EDL evidence strength)
+                           w_H = c_H / (c_H + c_V)
+                           w_V = c_V / (c_H + c_V)
+                           F   = w_H · H + w_V · V_norm
     Heat branch is BCE-trained (NOT a Dirichlet), so combined α_a supervision is N/A here.
     """
     heat_logit = mask_raw[:, 0:1]
@@ -875,6 +888,7 @@ def parse_dual_3ch(mask_raw, fusion_mode='noisy_or_vac', eps=1e-6):
     heat_p = heat_logit.sigmoid().squeeze(1)          # H ∈ [0,1]
     view_e = _view_from_2ch_evidence(edl_raw, eps=eps)
     vacuity_raw = view_e['u']                         # V = 2/S
+    w_H = w_V = None                                   # only set by 'moe' mode
 
     if fusion_mode == 'noisy_or_vac':
         v_norm = normalize_vacuity(vacuity_raw)
@@ -902,10 +916,20 @@ def parse_dual_3ch(mask_raw, fusion_mode='noisy_or_vac', eps=1e-6):
         b_a_obj = (b_h_obj * b_e_obj + b_h_obj * u_e + b_e_obj * u_h) / one_minus_C
         mask_pred = b_a_obj.clamp(0.0, 1.0)
         v_norm = vacuity_raw
+    elif fusion_mode == 'moe':
+        # 3-B-c: Evidence-based soft routing (Han et al. TPAMI'22 Dynamic Evidential Fusion).
+        # No learnable router → no Gumbel-Softmax, no load-balancing loss needed.
+        v_norm = normalize_vacuity(vacuity_raw)
+        c_H = (1.0 - 4.0 * heat_p * (1.0 - heat_p)).clamp(0.0, 1.0)  # H prediction sharpness
+        c_V = (1.0 - vacuity_raw).clamp(0.0, 1.0)                     # EDL evidence strength
+        Z = c_H + c_V + eps
+        w_H = c_H / Z
+        w_V = c_V / Z
+        mask_pred = (w_H * heat_p + w_V * v_norm).clamp(0.0, 1.0)
     else:
         raise ValueError(f"Unknown ESOD_FUSION_MODE for 3-ch: {fusion_mode}")
 
-    return {
+    out = {
         'mask_pred': mask_pred.detach(),
         'heat_p':    heat_p.detach(),
         'edl_p':     view_e['p_obj'].detach(),
@@ -913,6 +937,10 @@ def parse_dual_3ch(mask_raw, fusion_mode='noisy_or_vac', eps=1e-6):
         'v_norm':    v_norm.detach(),
         'u':         vacuity_raw.detach(),  # for HeatMapParser debug log compatibility
     }
+    if w_H is not None:
+        out['w_H'] = w_H.detach()
+        out['w_V'] = w_V.detach()
+    return out
 
 
 # Default thresholds per fusion mode (overridable by env ESOD_HM_THRES)
@@ -924,6 +952,7 @@ _FUSION_DEFAULT_THRES = {
     'heat_only':    0.50,
     'edl_only':     0.15,  # legacy EDL-only setting
     'gating':       0.50,  # 3-B-b: F = α·H + (1−α)·V_norm is a prob-like quantity → 0.5 default
+    'moe':          0.50,  # 3-B-c: F = w_H·H + w_V·V_norm is a prob-like quantity → 0.5 default
 }
 
 

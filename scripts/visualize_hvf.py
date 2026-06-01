@@ -78,10 +78,15 @@ def extract_maps(pred_masks_0):
     elif C == 3:
         # 3-B dual: ch0 = BCE heat logit, ch1-2 = EDL Dirichlet
         from models.common import parse_dual_3ch, _get_fusion_mode
-        parsed = parse_dual_3ch(pm, fusion_mode=_get_fusion_mode())
+        fm = _get_fusion_mode()
+        parsed = parse_dual_3ch(pm, fusion_mode=fm)
         H = parsed['heat_p'].cpu().numpy()[0]
         V = parsed['vacuity'].cpu().numpy()[0]
         Fm = parsed['mask_pred'].cpu().numpy()[0]
+        if fm == 'moe' and 'w_H' in parsed:
+            # MoE routing: also expose w_H as the "alpha" panel
+            alpha = parsed['w_H'].cpu().numpy()[0]
+            return {'H': H, 'V': V, 'F': Fm, 'alpha': alpha, 'C': C, 'mode': 'moe'}
     elif C == 4:
         from models.common import parse_dual_4ch, parse_dual_4ch_gating, _get_fusion_mode
         _fm = _get_fusion_mode()
@@ -137,10 +142,12 @@ def plot_panel(img_uint8, maps, out_path, title):
     if alpha is not None:
         ax4 = fig.add_subplot(gs[0, 4])
         im4 = ax4.imshow(alpha, vmin=0, vmax=1, cmap=cmap)
-        ax4.set_title(f'α-gate  (mean={alpha.mean():.3f}, p50={np.median(alpha):.3f})'); ax4.axis('off')
+        mode = maps.get('mode', 'gating')
+        panel_title = 'α-gate' if mode == 'gating' else 'w_H (MoE)'
+        ax4.set_title(f'{panel_title}  (mean={alpha.mean():.3f}, p50={np.median(alpha):.3f})'); ax4.axis('off')
         fig.colorbar(im4, ax=ax4, fraction=0.046)
 
-    # Histogram overlay — addresses prof's distribution-comparison check + α saturation check
+    # Histogram overlay — addresses prof's distribution-comparison check + α/w saturation check
     axh = fig.add_subplot(gs[1, :])
     bins = np.linspace(0, 1, 51)
     axh.hist(H.flatten(), bins=bins, alpha=0.5, label='H', color='C0', density=True)
@@ -148,10 +155,18 @@ def plot_panel(img_uint8, maps, out_path, title):
         axh.hist(V.flatten(), bins=bins, alpha=0.5, label='V', color='C3', density=True)
     axh.hist(Fm.flatten(), bins=bins, alpha=0.4, label='F', color='C2', histtype='step', linewidth=2, density=True)
     if alpha is not None:
-        axh.hist(alpha.flatten(), bins=bins, alpha=0.4, label='α-gate', color='C4', histtype='step', linewidth=2, density=True)
+        mode = maps.get('mode', 'gating')
+        leg = 'α-gate' if mode == 'gating' else 'w_H (MoE)'
+        axh.hist(alpha.flatten(), bins=bins, alpha=0.4, label=leg, color='C4', histtype='step', linewidth=2, density=True)
     axh.set_xlim(0, 1); axh.set_xlabel('value'); axh.set_ylabel('density')
-    title_hint = '(α: saturate 0/1 → hard switch; concentrate 0.5 → mere average)' if alpha is not None else '(V saturated near 1.0 → KL/EDL diagnosis)'
-    axh.set_title(f'H vs V vs F vs α distribution  {title_hint}')
+    if alpha is not None:
+        mode = maps.get('mode', 'gating')
+        title_hint = ('(α: saturate 0/1 → hard switch; concentrate 0.5 → mere average)'
+                      if mode == 'gating' else
+                      '(w_H: 0/1 → router collapsed to one expert; 0.5 → balanced)')
+    else:
+        title_hint = '(V saturated near 1.0 → KL/EDL diagnosis)'
+    axh.set_title(f'H vs V vs F vs gate distribution  {title_hint}')
     axh.legend()
 
     fig.suptitle(title)

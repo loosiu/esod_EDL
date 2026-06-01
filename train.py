@@ -66,6 +66,19 @@ def edl_stats_one_batch(model, dataloader, device):
         # 3-B variants: ch0 = BCE heat logit, ch1-2 = EDL Dirichlet evidence
         heat_p = hm[:, 0].sigmoid()
         edl_part = hm[:, 1:3]
+        # If fusion mode is 'moe', also compute w_H/w_V for monitoring
+        moe_w_H = None; moe_w_V = None
+        if os.environ.get('ESOD_FUSION_MODE', 'noisy_or_vac').strip().lower() == 'moe':
+            import torch.nn.functional as _F
+            ev = _F.softplus(hm[:, 1:3])
+            alpha_d = ev + 1.0
+            Sd = alpha_d.sum(dim=1)
+            vac = 2.0 / Sd
+            c_H = (1.0 - 4.0 * heat_p * (1.0 - heat_p)).clamp(0.0, 1.0)
+            c_V = (1.0 - vac).clamp(0.0, 1.0)
+            Z = c_H + c_V + 1e-6
+            moe_w_H = c_H / Z
+            moe_w_V = c_V / Z
     elif C == 4:
         # Two flavors of 4-ch — distinguished by ESOD_FUSION_MODE:
         #  - 'gating' (3-B-b): ch0 = BCE heat logit, ch1-2 = EDL Dirichlet, ch3 = gating logit
@@ -137,6 +150,19 @@ def edl_stats_one_batch(model, dataloader, device):
             "alpha_sat_low":  float((gate_alpha < 0.1).float().mean()),    # fraction near 0
             "alpha_sat_high": float((gate_alpha > 0.9).float().mean()),    # fraction near 1
             "alpha_neutral":  float(((gate_alpha > 0.4) & (gate_alpha < 0.6)).float().mean()),  # fraction near 0.5
+        })
+    if moe_w_H is not None:
+        # 3-B-c MoE routing diagnostics — addresses prof's concern about all-pixels-to-one-expert
+        wf = moe_w_H.flatten().float()
+        q_w = torch.tensor([0.10, 0.25, 0.50, 0.75, 0.90], device=wf.device)
+        w_pct = torch.quantile(wf, q_w).tolist()
+        out.update({
+            "moe_wH_mean":   float(moe_w_H.mean()),    # fraction routed to H expert (mean)
+            "moe_wH_std":    float(moe_w_H.std()),
+            "moe_wH_pct":    [f"{x:.3f}" for x in w_pct],
+            "moe_frac_H":    float((moe_w_H > 0.7).float().mean()),   # pixels strongly H-routed
+            "moe_frac_V":    float((moe_w_V > 0.7).float().mean()),   # pixels strongly V-routed
+            "moe_balanced":  float(((moe_w_H > 0.3) & (moe_w_H < 0.7)).float().mean()),  # balanced routing
         })
     return out
     
@@ -531,6 +557,12 @@ def train(hyp, opt, device, tb_writer=None):
                                  f"  α-gate saturation: low(<0.1)={edl_stats['alpha_sat_low']:.3f} "
                                  f"high(>0.9)={edl_stats['alpha_sat_high']:.3f} "
                                  f"neutral(0.4-0.6)={edl_stats['alpha_neutral']:.3f}")
+                    if edl_stats.get('moe_wH_mean') is not None:
+                        base += (f"\n  MoE w_H mean={edl_stats['moe_wH_mean']:.3f} std={edl_stats['moe_wH_std']:.3f} "
+                                 f"pct[10/25/50/75/90]={edl_stats.get('moe_wH_pct')}\n"
+                                 f"  MoE routing: H-dom(>0.7)={edl_stats['moe_frac_H']:.3f} "
+                                 f"V-dom(>0.7)={edl_stats['moe_frac_V']:.3f} "
+                                 f"balanced(0.3-0.7)={edl_stats['moe_balanced']:.3f}")
                     print(base)
                 else:
                     # EDL이 안 걸리면 이유까지 출력
