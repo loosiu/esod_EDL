@@ -173,7 +173,10 @@ def edl_stats_one_batch(model, dataloader, device):
                 "rolesep_frac_easy_px": rs['frac_easy_px'],
                 "rolesep_frac_hard_px": rs['frac_hard_px'],
                 "rolesep_frac_both_px": rs['frac_both_px'],
-                "rolesep_thresh_px":   float(os.environ.get('ESOD_HARD_THRESH_PX', '32')),
+                "rolesep_thresh_px":    float(os.environ.get('ESOD_HARD_THRESH_PX', '32')),
+                "rolesep_alpha":        rs.get('alpha_emph', float(os.environ.get('ESOD_ROLE_SEP_ALPHA', '1.0'))),
+                "rolesep_avg_w_heat":   rs.get('avg_w_heat'),
+                "rolesep_avg_w_edl":    rs.get('avg_w_edl'),
             })
     return out
     
@@ -575,11 +578,15 @@ def train(hyp, opt, device, tb_writer=None):
                                  f"V-dom(>0.7)={edl_stats['moe_frac_V']:.3f} "
                                  f"balanced(0.3-0.7)={edl_stats['moe_balanced']:.3f}")
                     if edl_stats.get('rolesep_frac_easy_px') is not None:
-                        base += (f"\n  Role-Sep (3-C): thresh_px={edl_stats['rolesep_thresh_px']:.0f} "
-                                 f"area_thresh={edl_stats['rolesep_thresh_px']**2:.0f}px²\n"
-                                 f"  → easy-region pixels (heat-supervised)={edl_stats['rolesep_frac_easy_px']:.4f}  "
-                                 f"hard-region pixels (EDL-supervised)={edl_stats['rolesep_frac_hard_px']:.4f}  "
-                                 f"both(overlap)={edl_stats['rolesep_frac_both_px']:.4f}")
+                        alpha_emph = edl_stats.get('rolesep_alpha', 1.0)
+                        base += (f"\n  Role-Sep (3-C soft): thresh_px={edl_stats['rolesep_thresh_px']:.0f} "
+                                 f"area_thresh={edl_stats['rolesep_thresh_px']**2:.0f}px² "
+                                 f"α_emph={alpha_emph:.2f}\n"
+                                 f"  → easy-region (heat-emphasized)={edl_stats['rolesep_frac_easy_px']:.4f}  "
+                                 f"hard-region (EDL-emphasized)={edl_stats['rolesep_frac_hard_px']:.4f}  "
+                                 f"both={edl_stats['rolesep_frac_both_px']:.4f}\n"
+                                 f"  avg_weight: heat={edl_stats.get('rolesep_avg_w_heat', 0):.3f} "
+                                 f"edl={edl_stats.get('rolesep_avg_w_edl', 0):.3f}  (1.0 = no emphasis)")
                     print(base)
                 else:
                     # EDL이 안 걸리면 이유까지 출력

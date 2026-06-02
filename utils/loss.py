@@ -376,28 +376,42 @@ class ComputeLoss:
             lam_h = float(_os.environ.get('ESOD_DUAL_LAM_H', '1.0'))
             lam_e = float(_os.environ.get('ESOD_DUAL_LAM_E', '1.0'))
 
-            # 3-C role-separation: split mask supervision by GT object scale.
-            # ESOD_ROLE_SEP=1 → heat supervises EASY (large, area ≥ thresh) only;
-            #                   EDL  supervises HARD (small, area <  thresh) only.
-            # Default threshold: 32² = 1024 px² (COCO small/medium boundary).
-            # Configurable via ESOD_HARD_THRESH_PX (e.g., 32 → 32² area).
+            # 3-C role-separation: SOFT split — both branches receive the FULL Gaussian mask,
+            # but per-pixel loss weights emphasize each branch's specialty region.
+            # This addresses Park MEH (ICLR'23) "different supervision per attribute" while
+            # avoiding the data-starvation failure mode of hard zero-out splits (which on
+            # VisDrone gave EDL only ~1.6% positive pixels, collapsing vacuity training).
+            #
+            # ESOD_ROLE_SEP=1            → activate soft role-separation
+            # ESOD_HARD_THRESH_PX (32)   → object pixel-area threshold (32² = 1024 px², COCO AP_s)
+            # ESOD_ROLE_SEP_ALPHA (1.0)  → emphasis strength
+            #     weight_heat = base_weight · (1 + α · is_easy_region)   # easy regions weighted (1+α)×
+            #     weight_edl  = base_weight · (1 + α · is_hard_region)   # hard regions weighted (1+α)×
+            # α=0 degenerates to 3-B-a; α=1 → 2× emphasis; α→∞ approaches hard-split limit.
             if _os.environ.get('ESOD_ROLE_SEP', '0') in ('1', 'true', 'True'):
                 thresh_px = float(_os.environ.get('ESOD_HARD_THRESH_PX', '32'))
                 area_thresh_px2 = thresh_px ** 2
+                alpha_emph = float(_os.environ.get('ESOD_ROLE_SEP_ALPHA', '1.0'))
                 is_easy, is_hard = self._build_easy_hard_regions(
                     masks, targets, imgsz=imgsz, area_thresh_px2=area_thresh_px2
                 )
-                mask_easy = masks * is_easy   # gaussian mask masked to easy regions only
-                mask_hard = masks * is_hard   # gaussian mask masked to hard regions only
+                base_w = weight if weight is not None else torch.ones_like(masks)
+                weight_heat = base_w * (1.0 + alpha_emph * is_easy)
+                weight_edl  = base_w * (1.0 + alpha_emph * is_hard)
+                # Heat trains on FULL gaussian mask with easy-region emphasis
                 l_heat = F.binary_cross_entropy_with_logits(
-                    p[:, 0:1], mask_easy, weight=weight, reduction='mean'
+                    p[:, 0:1], masks, weight=weight_heat, reduction='mean'
                 )
-                l_edl = self._compute_edl_pixl(p[:, 1:3], mask_hard, weight).squeeze(0)
+                # EDL trains on FULL gaussian mask with hard-region emphasis
+                l_edl = self._compute_edl_pixl(p[:, 1:3], masks, weight_edl).squeeze(0)
                 # Stats for monitoring (saved into class attribute for later inspection)
                 ComputeLoss._role_sep_stats = {
                     'frac_easy_px': float(is_easy.mean()),
                     'frac_hard_px': float(is_hard.mean()),
                     'frac_both_px': float((is_easy * is_hard).mean()),
+                    'alpha_emph':   alpha_emph,
+                    'avg_w_heat':   float(weight_heat.mean()),
+                    'avg_w_edl':    float(weight_edl.mean()),
                 }
             else:
                 l_heat = F.binary_cross_entropy_with_logits(
