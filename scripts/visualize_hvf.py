@@ -87,6 +87,10 @@ def extract_maps(pred_masks_0):
             # MoE routing: also expose w_H as the "alpha" panel
             alpha = parsed['w_H'].cpu().numpy()[0]
             return {'H': H, 'V': V, 'F': Fm, 'alpha': alpha, 'C': C, 'mode': 'moe'}
+        if fm == 'noisy_or_diss' and 'dissonance' in parsed:
+            # 3-D: expose dissonance map (5th panel = suppression signal, NOT routing weight)
+            alpha = parsed['dissonance'].cpu().numpy()[0]
+            return {'H': H, 'V': V, 'F': Fm, 'alpha': alpha, 'C': C, 'mode': 'diss'}
     elif C == 4:
         from models.common import parse_dual_4ch, parse_dual_4ch_gating, _get_fusion_mode
         _fm = _get_fusion_mode()
@@ -143,7 +147,11 @@ def plot_panel(img_uint8, maps, out_path, title):
         ax4 = fig.add_subplot(gs[0, 4])
         im4 = ax4.imshow(alpha, vmin=0, vmax=1, cmap=cmap)
         mode = maps.get('mode', 'gating')
-        panel_title = 'α-gate' if mode == 'gating' else 'w_H (MoE)'
+        panel_title = {
+            'gating': 'α-gate',
+            'moe':    'w_H (MoE)',
+            'diss':   'dissonance (suppress)',
+        }.get(mode, 'α')
         ax4.set_title(f'{panel_title}  (mean={alpha.mean():.3f}, p50={np.median(alpha):.3f})'); ax4.axis('off')
         fig.colorbar(im4, ax=ax4, fraction=0.046)
 
@@ -156,14 +164,16 @@ def plot_panel(img_uint8, maps, out_path, title):
     axh.hist(Fm.flatten(), bins=bins, alpha=0.4, label='F', color='C2', histtype='step', linewidth=2, density=True)
     if alpha is not None:
         mode = maps.get('mode', 'gating')
-        leg = 'α-gate' if mode == 'gating' else 'w_H (MoE)'
+        leg = {'gating': 'α-gate', 'moe': 'w_H (MoE)', 'diss': 'dissonance'}.get(mode, 'α')
         axh.hist(alpha.flatten(), bins=bins, alpha=0.4, label=leg, color='C4', histtype='step', linewidth=2, density=True)
     axh.set_xlim(0, 1); axh.set_xlabel('value'); axh.set_ylabel('density')
     if alpha is not None:
         mode = maps.get('mode', 'gating')
-        title_hint = ('(α: saturate 0/1 → hard switch; concentrate 0.5 → mere average)'
-                      if mode == 'gating' else
-                      '(w_H: 0/1 → router collapsed to one expert; 0.5 → balanced)')
+        title_hint = {
+            'gating': '(α: saturate 0/1 → hard switch; 0.5 → mere average)',
+            'moe':    '(w_H: 0/1 → router collapsed; 0.5 → balanced)',
+            'diss':   '(diss > 0.5 → confusion (suppressed); < 0.1 → clear (kept))',
+        }.get(mode, '')
     else:
         title_hint = '(V saturated near 1.0 → KL/EDL diagnosis)'
     axh.set_title(f'H vs V vs F vs gate distribution  {title_hint}')

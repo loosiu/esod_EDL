@@ -926,6 +926,22 @@ def parse_dual_3ch(mask_raw, fusion_mode='noisy_or_vac', eps=1e-6):
         w_H = c_H / Z
         w_V = c_V / Z
         mask_pred = (w_H * heat_p + w_V * v_norm).clamp(0.0, 1.0)
+    elif fusion_mode == 'noisy_or_diss':
+        # 3-D: Dissonance-suppressed noisy-OR.
+        #   F_propose  = 1 - (1 - H)(1 - V_norm)             [3-B-a noisy-OR — propose candidates]
+        #   F_suppress = 1 - dissonance                       [remove confusion regions]
+        #   F          = F_propose · F_suppress              [final patch-score]
+        # Binary K=2 dissonance (Jøsang Subjective Logic): diss = 2·min(b_bg, b_obj).
+        # Peaks at 1 when b_bg ≈ b_obj (perfect confusion); 0 when one class dominates.
+        # Orthogonal to vacuity: high diss = "both classes strongly claim this pixel" (confusion),
+        # high vac = "no evidence at all" (ignorance). Suppression removes confusion-only regions
+        # from patch candidates while keeping true uncertain regions (high vac, low diss).
+        v_norm = normalize_vacuity(vacuity_raw)
+        F_propose = 1.0 - (1.0 - heat_p) * (1.0 - v_norm)
+        diss = 2.0 * torch.minimum(view_e['b_bg'], view_e['b_obj'])      # ∈ [0, 1]
+        diss = diss.clamp(0.0, 1.0)
+        F_suppress = 1.0 - diss
+        mask_pred = (F_propose * F_suppress).clamp(0.0, 1.0)
     else:
         raise ValueError(f"Unknown ESOD_FUSION_MODE for 3-ch: {fusion_mode}")
 
@@ -937,6 +953,11 @@ def parse_dual_3ch(mask_raw, fusion_mode='noisy_or_vac', eps=1e-6):
         'v_norm':    v_norm.detach(),
         'u':         vacuity_raw.detach(),  # for HeatMapParser debug log compatibility
     }
+    # Expose dissonance and its components when computed (3-D)
+    if fusion_mode == 'noisy_or_diss':
+        out['dissonance']  = diss.detach()
+        out['F_propose']   = F_propose.detach()
+        out['F_suppress']  = F_suppress.detach()
     if w_H is not None:
         out['w_H'] = w_H.detach()
         out['w_V'] = w_V.detach()
@@ -953,6 +974,7 @@ _FUSION_DEFAULT_THRES = {
     'edl_only':     0.15,  # legacy EDL-only setting
     'gating':       0.50,  # 3-B-b: F = α·H + (1−α)·V_norm is a prob-like quantity → 0.5 default
     'moe':          0.50,  # 3-B-c: F = w_H·H + w_V·V_norm is a prob-like quantity → 0.5 default
+    'noisy_or_diss': 0.30,  # 3-D: F = noisy_or · (1−diss) is suppressed prob-like → lower default
 }
 
 

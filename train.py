@@ -68,7 +68,8 @@ def edl_stats_one_batch(model, dataloader, device):
         edl_part = hm[:, 1:3]
         # If fusion mode is 'moe', also compute w_H/w_V for monitoring
         moe_w_H = None; moe_w_V = None
-        if os.environ.get('ESOD_FUSION_MODE', 'noisy_or_vac').strip().lower() == 'moe':
+        fm_lower = os.environ.get('ESOD_FUSION_MODE', 'noisy_or_vac').strip().lower()
+        if fm_lower == 'moe':
             import torch.nn.functional as _F
             ev = _F.softplus(hm[:, 1:3])
             alpha_d = ev + 1.0
@@ -79,6 +80,16 @@ def edl_stats_one_batch(model, dataloader, device):
             Z = c_H + c_V + 1e-6
             moe_w_H = c_H / Z
             moe_w_V = c_V / Z
+        # If fusion mode is 'noisy_or_diss' (3-D), compute dissonance stats
+        diss_map = None
+        if fm_lower == 'noisy_or_diss':
+            import torch.nn.functional as _F
+            ev = _F.softplus(hm[:, 1:3])
+            alpha_d = ev + 1.0
+            Sd = alpha_d.sum(dim=1, keepdim=True)
+            b_bg = ((alpha_d[:, 0:1] - 1.0) / Sd).clamp(0.0, 1.0).squeeze(1)
+            b_obj = ((alpha_d[:, 1:2] - 1.0) / Sd).clamp(0.0, 1.0).squeeze(1)
+            diss_map = 2.0 * torch.minimum(b_bg, b_obj)   # Jøsang binary diss ∈ [0,1]
     elif C == 4:
         # Two flavors of 4-ch — distinguished by ESOD_FUSION_MODE:
         #  - 'gating' (3-B-b): ch0 = BCE heat logit, ch1-2 = EDL Dirichlet, ch3 = gating logit
@@ -163,6 +174,18 @@ def edl_stats_one_batch(model, dataloader, device):
             "moe_frac_H":    float((moe_w_H > 0.7).float().mean()),   # pixels strongly H-routed
             "moe_frac_V":    float((moe_w_V > 0.7).float().mean()),   # pixels strongly V-routed
             "moe_balanced":  float(((moe_w_H > 0.3) & (moe_w_H < 0.7)).float().mean()),  # balanced routing
+        })
+    # 3-D dissonance stats (only when fusion_mode = 'noisy_or_diss')
+    if diss_map is not None:
+        df = diss_map.flatten().float()
+        q_d = torch.tensor([0.10, 0.25, 0.50, 0.75, 0.90], device=df.device)
+        d_pct = torch.quantile(df, q_d).tolist()
+        out.update({
+            "diss_mean":   float(diss_map.mean()),
+            "diss_std":    float(diss_map.std()),
+            "diss_pct":    [f"{x:.3f}" for x in d_pct],
+            "diss_frac_high":  float((diss_map > 0.5).float().mean()),  # confusion-suppressed pixels
+            "diss_frac_low":   float((diss_map < 0.1).float().mean()),  # clear (low confusion)
         })
     # 3-C role-separation stats (computed each training step in compute_loss_seg → stored on ComputeLoss)
     if os.environ.get('ESOD_ROLE_SEP', '0') in ('1', 'true', 'True'):
@@ -577,6 +600,11 @@ def train(hyp, opt, device, tb_writer=None):
                                  f"  MoE routing: H-dom(>0.7)={edl_stats['moe_frac_H']:.3f} "
                                  f"V-dom(>0.7)={edl_stats['moe_frac_V']:.3f} "
                                  f"balanced(0.3-0.7)={edl_stats['moe_balanced']:.3f}")
+                    if edl_stats.get('diss_mean') is not None:
+                        base += (f"\n  Dissonance (3-D, Jøsang binary): mean={edl_stats['diss_mean']:.3f} "
+                                 f"std={edl_stats['diss_std']:.3f} pct[10/25/50/75/90]={edl_stats.get('diss_pct')}\n"
+                                 f"  Confusion: high(>0.5, suppressed)={edl_stats['diss_frac_high']:.3f}  "
+                                 f"low(<0.1, kept)={edl_stats['diss_frac_low']:.3f}")
                     if edl_stats.get('rolesep_frac_easy_px') is not None:
                         alpha_emph = edl_stats.get('rolesep_alpha', 1.0)
                         base += (f"\n  Role-Sep (3-C soft): thresh_px={edl_stats['rolesep_thresh_px']:.0f} "
