@@ -186,8 +186,8 @@ class ComputeLoss:
         
         if masks is not None and p_seg is not None:
             assert len(p_seg) == 1
-            lpixl, larea, ldist = self.compute_loss_seg(p_seg[0], masks, targets, weight=m_weights)
-        
+            lpixl, larea, ldist = self.compute_loss_seg(p_seg[0], masks, targets, imgsz=imgsz, weight=m_weights)
+
         loss = (lbox + lobj + lcls) * 1.0 + (lpixl + larea + ldist) * 0.2
         loss_items = torch.cat((lbox, lobj, lcls, lpixl, larea, ldist, loss)).detach()
         return loss * bs, loss_items
@@ -357,7 +357,7 @@ class ComputeLoss:
     #                   Weights via env: ESOD_DUAL_LAM_H (default 1.0), ESOD_DUAL_LAM_E (default 1.0),
     #                                    ESOD_DUAL_LAM_A (default 1.0).  Set LAM_A=0 to disable
     #                                    supervision on the combined view (run DS only at inference).
-    def compute_loss_seg(self, p, masks, targets, weight=None):
+    def compute_loss_seg(self, p, masks, targets, imgsz=None, weight=None):
         device = targets.device
         bs, nc_t, ny, nx = masks.shape
         assert nc_t == 1, "GT mask는 1채널(0/1)이어야 함"
@@ -375,10 +375,35 @@ class ComputeLoss:
             import os as _os
             lam_h = float(_os.environ.get('ESOD_DUAL_LAM_H', '1.0'))
             lam_e = float(_os.environ.get('ESOD_DUAL_LAM_E', '1.0'))
-            l_heat = F.binary_cross_entropy_with_logits(
-                p[:, 0:1], masks, weight=weight, reduction='mean'
-            )
-            l_edl  = self._compute_edl_pixl(p[:, 1:3], masks, weight).squeeze(0)
+
+            # 3-C role-separation: split mask supervision by GT object scale.
+            # ESOD_ROLE_SEP=1 → heat supervises EASY (large, area ≥ thresh) only;
+            #                   EDL  supervises HARD (small, area <  thresh) only.
+            # Default threshold: 32² = 1024 px² (COCO small/medium boundary).
+            # Configurable via ESOD_HARD_THRESH_PX (e.g., 32 → 32² area).
+            if _os.environ.get('ESOD_ROLE_SEP', '0') in ('1', 'true', 'True'):
+                thresh_px = float(_os.environ.get('ESOD_HARD_THRESH_PX', '32'))
+                area_thresh_px2 = thresh_px ** 2
+                is_easy, is_hard = self._build_easy_hard_regions(
+                    masks, targets, imgsz=imgsz, area_thresh_px2=area_thresh_px2
+                )
+                mask_easy = masks * is_easy   # gaussian mask masked to easy regions only
+                mask_hard = masks * is_hard   # gaussian mask masked to hard regions only
+                l_heat = F.binary_cross_entropy_with_logits(
+                    p[:, 0:1], mask_easy, weight=weight, reduction='mean'
+                )
+                l_edl = self._compute_edl_pixl(p[:, 1:3], mask_hard, weight).squeeze(0)
+                # Stats for monitoring (saved into class attribute for later inspection)
+                ComputeLoss._role_sep_stats = {
+                    'frac_easy_px': float(is_easy.mean()),
+                    'frac_hard_px': float(is_hard.mean()),
+                    'frac_both_px': float((is_easy * is_hard).mean()),
+                }
+            else:
+                l_heat = F.binary_cross_entropy_with_logits(
+                    p[:, 0:1], masks, weight=weight, reduction='mean'
+                )
+                l_edl = self._compute_edl_pixl(p[:, 1:3], masks, weight).squeeze(0)
             lpixl = (lam_h * l_heat + lam_e * l_edl).reshape(1)
         elif Cch == 4:
             import os as _os
@@ -469,6 +494,57 @@ class ComputeLoss:
         if weight is not None:
             edl_loss = edl_loss * weight.squeeze(1)
         return edl_loss.mean().reshape(1)
+
+    def _build_easy_hard_regions(self, masks, targets, imgsz, area_thresh_px2=1024.0):
+        """3-C: Split GT objects into easy (large, area ≥ thresh) and hard (small, area < thresh)
+        by object pixel area, then build per-pixel binary region masks in the mask-resolution space.
+
+        Args:
+            masks   : [B, 1, H_m, W_m] — the GT mask (Gaussian/SAM-smoothed) used for supervision.
+            targets : [N, 6] = [batch_idx, cls, xc, yc, w, h] all normalized to [0, 1].
+            imgsz   : (B, C, H, W) of the input image tensor (used to convert normalized targets
+                       to pixel area).
+            area_thresh_px2 : object pixel-area threshold for the easy/hard split. Default 32² = 1024
+                       (COCO AP_s vs AP_m boundary). Configurable via env ESOD_HARD_THRESH_PX (squared).
+
+        Returns:
+            is_easy : [B, 1, H_m, W_m] binary — 1 where pixel falls inside any EASY (large) target.
+            is_hard : [B, 1, H_m, W_m] binary — 1 where pixel falls inside any HARD (small) target.
+
+        Pixels with no overlapping target → both is_easy=0 and is_hard=0 (background).
+        Pixels inside overlapping easy+hard objects → both =1 (heat & EDL both supervise that pixel).
+        """
+        B, _, H_m, W_m = masks.shape
+        img_h, img_w = int(imgsz[2]), int(imgsz[3])
+
+        is_easy = torch.zeros_like(masks)
+        is_hard = torch.zeros_like(masks)
+
+        if targets is None or len(targets) == 0:
+            return is_easy, is_hard
+
+        # Pixel area per target: w_norm * h_norm * img_w * img_h
+        areas_px = (targets[:, 4] * img_w) * (targets[:, 5] * img_h)
+        is_easy_obj = areas_px >= area_thresh_px2     # [N] bool
+
+        for n in range(targets.shape[0]):
+            bi = int(targets[n, 0])
+            xc, yc = float(targets[n, 2]), float(targets[n, 3])
+            w_n, h_n = float(targets[n, 4]), float(targets[n, 5])
+            # Convert to mask-resolution rectangle [x1, y1, x2, y2]
+            x_c_m, y_c_m = xc * W_m, yc * H_m
+            w_m_obj, h_m_obj = w_n * W_m, h_n * H_m
+            x1 = max(0, int(x_c_m - w_m_obj / 2.0))
+            x2 = min(W_m, int(x_c_m + w_m_obj / 2.0) + 1)
+            y1 = max(0, int(y_c_m - h_m_obj / 2.0))
+            y2 = min(H_m, int(y_c_m + h_m_obj / 2.0) + 1)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            if bool(is_easy_obj[n]):
+                is_easy[bi, 0, y1:y2, x1:x2] = 1.0
+            else:
+                is_hard[bi, 0, y1:y2, x1:x2] = 1.0
+        return is_easy, is_hard
 
     def _compute_edl_pixl(self, p, masks, weight=None):
         """EDL Dirichlet pixel loss on a 2-ch (bg,obj) evidence-logits tensor.

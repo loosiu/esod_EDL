@@ -164,6 +164,17 @@ def edl_stats_one_batch(model, dataloader, device):
             "moe_frac_V":    float((moe_w_V > 0.7).float().mean()),   # pixels strongly V-routed
             "moe_balanced":  float(((moe_w_H > 0.3) & (moe_w_H < 0.7)).float().mean()),  # balanced routing
         })
+    # 3-C role-separation stats (computed each training step in compute_loss_seg → stored on ComputeLoss)
+    if os.environ.get('ESOD_ROLE_SEP', '0') in ('1', 'true', 'True'):
+        from utils.loss import ComputeLoss
+        rs = getattr(ComputeLoss, '_role_sep_stats', None)
+        if rs is not None:
+            out.update({
+                "rolesep_frac_easy_px": rs['frac_easy_px'],
+                "rolesep_frac_hard_px": rs['frac_hard_px'],
+                "rolesep_frac_both_px": rs['frac_both_px'],
+                "rolesep_thresh_px":   float(os.environ.get('ESOD_HARD_THRESH_PX', '32')),
+            })
     return out
     
 def train(hyp, opt, device, tb_writer=None):
@@ -563,6 +574,12 @@ def train(hyp, opt, device, tb_writer=None):
                                  f"  MoE routing: H-dom(>0.7)={edl_stats['moe_frac_H']:.3f} "
                                  f"V-dom(>0.7)={edl_stats['moe_frac_V']:.3f} "
                                  f"balanced(0.3-0.7)={edl_stats['moe_balanced']:.3f}")
+                    if edl_stats.get('rolesep_frac_easy_px') is not None:
+                        base += (f"\n  Role-Sep (3-C): thresh_px={edl_stats['rolesep_thresh_px']:.0f} "
+                                 f"area_thresh={edl_stats['rolesep_thresh_px']**2:.0f}px²\n"
+                                 f"  → easy-region pixels (heat-supervised)={edl_stats['rolesep_frac_easy_px']:.4f}  "
+                                 f"hard-region pixels (EDL-supervised)={edl_stats['rolesep_frac_hard_px']:.4f}  "
+                                 f"both(overlap)={edl_stats['rolesep_frac_both_px']:.4f}")
                     print(base)
                 else:
                     # EDL이 안 걸리면 이유까지 출력
